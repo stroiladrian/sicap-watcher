@@ -2,9 +2,8 @@ name: SICAP watcher
 
 on:
   schedule:
-    # Every 2 hours, 08:23–22:23 Bucharest. GitHub cron is UTC, so both the
-    # winter (UTC+2) and summer (UTC+3) sets run; the script drops the ones
-    # that fall outside 08:00–22:59 local time.
+    # Hourly in UTC; the gate below keeps only 08, 10 … 22 Bucharest time,
+    # so it stays right through summer/winter time changes.
     - cron: "23 5-20 * * *"
   workflow_dispatch:
     inputs:
@@ -23,7 +22,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     steps:
       - name: Skip odd hours (Bucharest)
         id: gate
@@ -39,45 +38,25 @@ jobs:
       - uses: actions/checkout@v4
         if: steps.gate.outputs.run == 'yes'
 
-      - uses: actions/setup-python@v5
-        if: steps.gate.outputs.run == 'yes'
-        with:
-          python-version: "3.12"
-          cache: pip
-
-      - name: Install Playwright + Chromium
-        if: steps.gate.outputs.run == 'yes'
-        run: |
-          pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
-
-      - name: Check for new listings
+      - name: Check for new purchases
         if: steps.gate.outputs.run == 'yes'
         env:
-          CALLMEBOT_PHONE: ${{ secrets.CALLMEBOT_PHONE }}
-          CALLMEBOT_APIKEY: ${{ secrets.CALLMEBOT_APIKEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          WATCH_URLS: ${{ vars.WATCH_URLS }}
+          CALLMEBOT_PHONE: ${{ secrets.CALLMEBOT_PHONE }}
+          CALLMEBOT_APIKEY: ${{ secrets.CALLMEBOT_APIKEY }}
+          WATCH_AUTHORITIES: ${{ vars.WATCH_AUTHORITIES }}
           FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
           TEST_MESSAGE: ${{ inputs.test_message && '1' || '0' }}
-        run: python watcher/check.py
+        run: python3 watcher/check.py
 
-      - name: Save debug page if blocked
-        if: failure() && steps.gate.outputs.run == 'yes'
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug
-          path: debug/
-          if-no-files-found: ignore
-
-      - name: Commit seen listings
+      - name: Save seen purchases
         if: always() && steps.gate.outputs.run == 'yes'
         run: |
           git config user.name "sicap-watcher"
           git config user.email "sicap-watcher@users.noreply.github.com"
           git add watcher/seen.json 2>/dev/null || exit 0
           git diff --cached --quiet && exit 0
-          git commit -m "Update seen listings"
+          git commit -m "Update seen purchases"
           git push

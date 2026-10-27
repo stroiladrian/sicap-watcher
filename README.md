@@ -1,25 +1,24 @@
 # SICAP watcher
 
-Checks https://sicap.ai/achizitii/autoritate/11866 (Orasul Deta) every 2 hours, 08:00–22:00 Bucharest time, on GitHub's servers, and sends only new listings to every alert channel you've set up. Free.
+Checks Orasul Deta's direct purchases every 2 hours, 08:00–22:00 Bucharest time, straight from the official SICAP public API (e-licitatie.ro), and sends only new ones to your alert channels. Runs on GitHub, free, no MacBook needed.
 
 ## Alert channels
 
-Set any of these as repo secrets (Settings → Secrets and variables → Actions → *Secrets*). Alerts go to all channels that are set.
+Repo secrets (Settings → Secrets and variables → Actions → *Secrets*). Alerts go to every channel that's set.
 
-- **ntfy** (push notification app, no account): `NTFY_TOPIC`, a long random name you also subscribe to in the ntfy app.
-- **Telegram**: `TELEGRAM_BOT_TOKEN` (from @BotFather) and `TELEGRAM_CHAT_ID`.
-- **WhatsApp via CallMeBot**: `CALLMEBOT_PHONE` (e.g. `+40712345678`) and `CALLMEBOT_APIKEY` (from the steps on callmebot.com).
+- **Telegram**: `TELEGRAM_BOT_TOKEN` (from @BotFather) and `TELEGRAM_CHAT_ID`
+- **ntfy**: `NTFY_TOPIC`, a long random name you subscribe to in the ntfy app
+- **WhatsApp via CallMeBot**: `CALLMEBOT_PHONE` (e.g. `+40712345678`) and `CALLMEBOT_APIKEY`
 
-## Setup
+## Use
 
-1. Add the secrets for at least one channel.
-2. **Test**: Actions → *SICAP watcher* → *Run workflow*, tick "Only send a test alert".
-3. **First real run**: *Run workflow* again, unticked. It saves the current listings and sends "SICAP watcher active". After that you only hear about new items.
+- **Test alert**: Actions → *SICAP watcher* → *Run workflow*, tick "Only send a test alert".
+- **Check now**: *Run workflow*, unticked. The very first check saves what's already there and sends "SICAP watcher active"; after that you only hear about new purchases.
 
-## More pages
+## More authorities
 
-Add a repo *variable* `WATCH_URLS` (same settings page, *Variables* tab) with one URL per line. Each page is tracked separately.
+Add a repo *variable* `WATCH_AUTHORITIES` (same settings page, *Variables* tab): one per line, either the ID (`11866`) or a sicap.ai link like `https://sicap.ai/achizitii/autoritate/11866`. If you set it, include Deta too.
 
 ## If it breaks
 
-A failed run (page blocked, layout changed, alert not sent) shows red in Actions and GitHub emails you. The page screenshot is attached to the run as the `debug` artifact.
+A failed run (API down, alert not sent) shows red in Actions and GitHub emails you. Unsent alerts are retried on the next run.

@@ -1,13 +1,14 @@
-"""SICAP watcher: opens a sicap.ai authority page in headless Chromium,
-finds listings not seen before, and sends them to WhatsApp (CallMeBot), Telegram and/or ntfy.
+"""SICAP watcher: asks the official SICAP public API (e-licitatie.ro) for an
+authority's direct purchases, finds ones not seen before, and alerts on
+Telegram, ntfy and/or WhatsApp (CallMeBot).
 
 Env:
-  WATCH_URLS         newline/comma separated pages to watch (default: Orasul Deta)
-  CALLMEBOT_PHONE    your WhatsApp number in international format, e.g. +40712345678
-  CALLMEBOT_APIKEY   key CallMeBot sent you
+  WATCH_AUTHORITIES  authority IDs or sicap.ai / e-licitatie links, one per line
+                     (default: 11866 = Orasul Deta)
+  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   Telegram bot
+  NTFY_TOPIC         ntfy.sh topic (use a long random name)
+  CALLMEBOT_PHONE, CALLMEBOT_APIKEY      WhatsApp via CallMeBot
   FORCE_RUN=1        ignore the 08:00-22:00 window (manual runs)
-  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   optional Telegram bot
-  NTFY_TOPIC         optional ntfy.sh topic (use a long random name)
   TEST_MESSAGE=1     send a test message and exit
 """
 import json
@@ -15,22 +16,22 @@ import os
 import re
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from playwright.sync_api import sync_playwright
-
 ROOT = Path(__file__).resolve().parent
 STATE = ROOT / "seen.json"
-DEBUG = ROOT.parent / "debug"
 TZ = ZoneInfo("Europe/Bucharest")
-DEFAULT_URLS = ["https://sicap.ai/achizitii/autoritate/11866"]
-
-# SICAP notice / direct-purchase IDs, e.g. DA41381570, ADV1234567, CAN1234567
-ID_RE = re.compile(r"\b(?:DA|ADV|CAN|SCN|RFQ|CN|PI|DAN)\d{6,}\b")
+DEFAULT_AUTHORITIES = ["11866"]
+API = "https://www.e-licitatie.ro/api-pub/DirectAcquisitionCommon/GetDirectAcquisitionList/"
+VIEW = "https://e-licitatie.ro/pub/direct-acquisition/view/{}"
+SICAP_AI = "https://sicap.ai/achizitii/autoritate/{}"
+LOOKBACK_DAYS = 60
+MONTHS = "ian feb mar apr mai iun iul aug sep oct noi dec".split()
 
 
 def now_local():
@@ -38,12 +39,12 @@ def now_local():
 
 
 def in_window():
-    """Runs are scheduled for both summer and winter time; keep only the ones
-    that land between 08:00 and 22:59 Bucharest time."""
     if os.environ.get("FORCE_RUN") == "1":
         return True
     return 8 <= now_local().hour <= 22
 
+
+# ---------- alerts ----------
 
 def _env(name):
     return os.environ.get(name, "").strip()
@@ -81,7 +82,7 @@ def send_callmebot(text):
     for chunk in _chunks(text, 900):
         q = urllib.parse.urlencode({"phone": phone, "text": chunk, "apikey": key})
         ok &= _request("CallMeBot", f"https://api.callmebot.com/whatsapp.php?{q}")
-        time.sleep(5)  # CallMeBot rate limit
+        time.sleep(5)
     return ok
 
 
@@ -96,125 +97,117 @@ def send_telegram(text):
 
 
 def send_ntfy(text):
-    topic = _env("NTFY_TOPIC")
     title, _, body = text.partition("\n")
     q = urllib.parse.urlencode({"title": title})
-    return _request("ntfy", f"https://ntfy.sh/{urllib.parse.quote(topic)}?{q}",
+    return _request("ntfy", f"https://ntfy.sh/{urllib.parse.quote(_env('NTFY_TOPIC'))}?{q}",
                     (body.strip() or title).encode("utf-8"))
 
 
 def notify(text):
-    """Send to every channel that has its secrets set. True if at least one worked."""
     channels = []
-    if _env("CALLMEBOT_PHONE") and _env("CALLMEBOT_APIKEY"):
-        channels.append(send_callmebot)
     if _env("TELEGRAM_BOT_TOKEN") and _env("TELEGRAM_CHAT_ID"):
         channels.append(send_telegram)
     if _env("NTFY_TOPIC"):
         channels.append(send_ntfy)
+    if _env("CALLMEBOT_PHONE") and _env("CALLMEBOT_APIKEY"):
+        channels.append(send_callmebot)
     if not channels:
         print("No alert channel configured; message would have been:\n" + text)
         return False
     return any([ch(text) for ch in channels])
 
 
-EXTRACT_JS = r"""
-(idSource) => {
-  const idRe = new RegExp(idSource, 'g');
-  const out = {};
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-  const hits = [];
-  while (walker.nextNode()) {
-    const t = walker.currentNode.nodeValue;
-    const m = t && t.match(idRe);
-    if (m) for (const id of m) hits.push([id, walker.currentNode.parentElement]);
-  }
-  const countIds = (el) => new Set((el.innerText || '').match(idRe) || []).size;
-  for (const [id, start] of hits) {
-    if (out[id]) continue;
-    // climb to the largest ancestor that still contains only this one ID = the listing card/row
-    let el = start, best = start;
-    while (el && el !== document.body) {
-      if (countIds(el) > 1) break;
-      best = el;
-      el = el.parentElement;
+# ---------- SICAP ----------
+
+def fetch(authority_id):
+    """Recent direct purchases for one authority, keyed by DA code."""
+    since = (datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)).strftime(
+        "%Y-%m-%dT00:00:00.000Z")
+    base = {
+        "pageSize": 100, "pageIndex": 0, "showOngoingDa": False, "cookieContext": None,
+        "sysDirectAcquisitionStateId": None, "publicationDateStart": None,
+        "publicationDateEnd": None, "finalizationDateStart": None,
+        "finalizationDateEnd": None, "cpvCategoryId": None, "cpvCodeId": None,
+        "contractingAuthorityId": int(authority_id), "supplierId": None,
+        "directAcquisitionName": None, "uniqueIdentificationCode": None,
     }
-    const link = best.querySelector('a[href]') || best.closest('a[href]');
-    out[id] = {
-      text: (best.innerText || '').trim(),
-      href: link ? link.href : null,
-    };
-  }
-  return out;
-}
-"""
+    queries = [
+        {**base, "publicationDateStart": since},
+        {**base, "finalizationDateStart": since},
+        {**base, "publicationDateStart": since, "showOngoingDa": True},
+    ]
+    items, errors = {}, 0
+    for body in queries:
+        req = urllib.request.Request(API, data=json.dumps(body).encode(), method="POST", headers={
+            "Content-Type": "application/json;charset=UTF-8",
+            "Accept": "application/json, text/plain, */*",
+            "Culture": "ro",
+            "Origin": "https://www.e-licitatie.ro",
+            "Referer": "https://www.e-licitatie.ro/pub/direct-acquisitions/list/1",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                data = json.loads(r.read().decode("utf-8"))
+        except Exception as e:  # noqa: BLE001
+            print(f"SICAP API error ({authority_id}): {e}")
+            errors += 1
+            continue
+        for it in data.get("items") or []:
+            code = it.get("uniqueIdentificationCode")
+            if code:
+                items[code] = it
+        time.sleep(1)
+    if errors == len(queries):
+        return None
+    return items
 
 
-def scrape(url):
-    with sync_playwright() as p:
-        browser = p.chromium.launch(args=["--disable-blink-features=AutomationControlled"])
-        ctx = browser.new_context(
-            locale="ro-RO",
-            timezone_id="Europe/Bucharest",
-            viewport={"width": 1366, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
-            ),
-        )
-        page = ctx.new_page()
-        page.goto(url, wait_until="domcontentloaded", timeout=90_000)
-        items = {}
-        # bot checks usually resolve within a few seconds; poll for listings
-        for _ in range(12):
-            page.wait_for_timeout(5_000)
-            items = page.evaluate(EXTRACT_JS, ID_RE.pattern)
-            if items:
-                page.wait_for_timeout(3_000)  # let the rest of the list render
-                items = page.evaluate(EXTRACT_JS, ID_RE.pattern)
-                break
-        if not items:
-            DEBUG.mkdir(exist_ok=True)
-            page.screenshot(path=str(DEBUG / "page.png"), full_page=True)
-            (DEBUG / "page.html").write_text(page.content(), encoding="utf-8")
-            (DEBUG / "title.txt").write_text(page.title(), encoding="utf-8")
-        browser.close()
-        return items
+def ron(v):
+    if v is None:
+        return None
+    whole = f"{round(v):,}".replace(",", ".")
+    return f"{whole} RON"
 
 
-MONEY_RE = re.compile(r"[\d][\d.\s]*(?:,\d+)?\s*(?:RON|LEI|lei|EUR)")
-DATE_RE = re.compile(
-    r"\b\d{1,2}[./ ](?:\d{1,2}|ian|feb|mar|apr|mai|iun|iul|aug|sep|oct|noi|nov|dec)[a-z.]*[./ ]\d{2,4}\b",
-    re.I,
-)
+def ro_date(s):
+    try:
+        d = datetime.fromisoformat(s)
+    except (TypeError, ValueError):
+        return None
+    return f"{d.day} {MONTHS[d.month - 1]} {d.year}"
 
 
-def format_item(item_id, item):
-    lines = [l.strip() for l in item["text"].splitlines() if l.strip()]
-    title = next((l for l in lines if not ID_RE.fullmatch(l) and len(l) > 3
-                  and not MONEY_RE.search(l) and not DATE_RE.fullmatch(l)), item_id)
-    money = next((MONEY_RE.search(l).group(0) for l in lines if MONEY_RE.search(l)), None)
-    date = next((DATE_RE.search(l).group(0) for l in lines if DATE_RE.search(l)), None)
-    others = [l for l in lines if l != title and item_id not in l
-              and not MONEY_RE.search(l) and not (date and date in l)]
-    supplier = others[0] if others else None
-    out = [f"🆕 {title[:140]}"]
-    meta = []
-    if money:
-        meta.append(f"💰 {money}")
-    if supplier:
-        meta.append(f"🏢 {supplier[:60]}")
-    if date:
-        meta.append(f"📅 {date}")
+def format_item(it):
+    supplier = re.sub(r"^RO?\d+\s+", "", it.get("supplier") or "").strip()
+    value = it.get("closingValue") or it.get("estimatedValueRon")
+    meta = [m for m in (
+        f"💰 {ron(value)}" if value else None,
+        f"🏢 {supplier[:60]}" if supplier else None,
+        f"📅 {ro_date(it.get('publicationDate'))}" if it.get("publicationDate") else None,
+    ) if m]
+    lines = [f"🆕 {(it.get('directAcquisitionName') or it['uniqueIdentificationCode'])[:150]}"]
     if meta:
-        out.append(" · ".join(meta))
-    out.append(f"#{item_id}" + (f" {item['href']}" if item.get("href") else ""))
-    return "\n".join(out)
+        lines.append(" · ".join(meta))
+    lines.append(VIEW.format(it["directAcquisitionId"]))
+    return "\n".join(lines)
+
+
+def authority_ids():
+    raw = _env("WATCH_AUTHORITIES").replace(",", "\n")
+    ids = []
+    for line in raw.splitlines():
+        m = re.search(r"(\d+)\D*$", line.strip())
+        if m:
+            ids.append(m.group(1))
+    return ids or DEFAULT_AUTHORITIES
 
 
 def load_state():
     if STATE.exists():
-        return json.loads(STATE.read_text(encoding="utf-8"))
+        data = json.loads(STATE.read_text(encoding="utf-8") or "{}")
+        return {k: v for k, v in data.items() if k.isdigit()}  # drop old sicap.ai keys
     return {}
 
 
@@ -225,49 +218,45 @@ def save_state(state):
 
 def main():
     if os.environ.get("TEST_MESSAGE") == "1":
-        ok = notify("✅ SICAP watcher: test message. Alerts will arrive here.")
-        sys.exit(0 if ok else 1)
+        sys.exit(0 if notify("✅ SICAP watcher: test message. Alerts will arrive here.") else 1)
 
     if not in_window():
         print(f"Outside 08:00-22:00 Bucharest ({now_local():%H:%M}); skipping.")
         return
 
-    raw = os.environ.get("WATCH_URLS", "").replace(",", "\n")
-    urls = [u.strip() for u in raw.splitlines() if u.strip()] or DEFAULT_URLS
     state = load_state()
     failed = []
 
-    for url in urls:
-        items = scrape(url)
-        if not items:
-            print(f"No listings found on {url} (blocked or layout changed). See debug/.")
-            failed.append(url)
+    for aid in authority_ids():
+        items = fetch(aid)
+        if items is None:
+            failed.append(aid)
             continue
-        seen = set(state.get(url, {}).get("ids", []))
-        first_run = url not in state
-        new = [i for i in items if i not in seen]
-        print(f"{url}: {len(items)} listings, {len(new)} new, first_run={first_run}")
+        prev = state.get(aid)
+        seen = set(prev["ids"]) if prev else set()
+        new = sorted((it for code, it in items.items() if code not in seen),
+                     key=lambda it: it.get("publicationDate") or "")
+        name = next((re.sub(r"^RO?\d+\s+", "", it.get("contractingAuthority") or "")
+                     for it in items.values()), "") or f"autoritate {aid}"
+        print(f"{name} ({aid}): {len(items)} recent, {len(new)} new, first_run={prev is None}")
 
-        if first_run:
-            notify(
-                f"✅ SICAP watcher active\n{len(items)} existing listings saved, "
-                f"you'll only get alerts for new ones.\n🔗 {url}"
-            )
+        if prev is None:
+            notify(f"✅ SICAP watcher active · {name}\n{len(items)} recent purchases saved, "
+                   f"you'll only get alerts for new ones.\n🔗 {SICAP_AI.format(aid)}")
         elif new:
-            header = f"🔔 SICAP – {len(new)} new" if len(new) > 1 else "🔔 SICAP – 1 new"
-            body = "\n\n".join(format_item(i, items[i]) for i in new)
-            if not notify(f"{header}\n\n{body}\n\n🔗 {url}"):
-                failed.append(url)
-                continue  # don't mark as seen, retry next run
+            header = f"🔔 SICAP · {name} – {len(new)} new"
+            body = "\n\n".join(format_item(it) for it in new)
+            if not notify(f"{header}\n\n{body}\n\n🔗 {SICAP_AI.format(aid)}"):
+                failed.append(aid)
+                continue  # retry next run
 
-        state[url] = {
-            "ids": sorted(seen | set(items)),
-            "last_ok": now_local().strftime("%Y-%m-%d"),
-        }
+        state[aid] = {"ids": sorted(seen | set(items)),
+                      "last_ok": now_local().strftime("%Y-%m-%d")}
 
     save_state(state)
     if failed:
-        sys.exit(1)  # GitHub emails you when a run fails
+        print("Failed for:", ", ".join(failed))
+        sys.exit(1)
 
 
 if __name__ == "__main__":
