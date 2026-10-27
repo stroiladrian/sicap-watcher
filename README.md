@@ -1,15 +1,20 @@
 # SICAP watcher
 
-Checks https://sicap.ai/achizitii/autoritate/11866 (Orasul Deta) every 2 hours, 08:00–22:00 Bucharest time, on GitHub's servers, and sends only new listings to WhatsApp via CallMeBot. Free.
+Checks https://sicap.ai/achizitii/autoritate/11866 (Orasul Deta) every 2 hours, 08:00–22:00 Bucharest time, on GitHub's servers, and sends only new listings to every alert channel you've set up. Free.
+
+## Alert channels
+
+Set any of these as repo secrets (Settings → Secrets and variables → Actions → *Secrets*). Alerts go to all channels that are set.
+
+- **ntfy** (push notification app, no account): `NTFY_TOPIC`, a long random name you also subscribe to in the ntfy app.
+- **Telegram**: `TELEGRAM_BOT_TOKEN` (from @BotFather) and `TELEGRAM_CHAT_ID`.
+- **WhatsApp via CallMeBot**: `CALLMEBOT_PHONE` (e.g. `+40712345678`) and `CALLMEBOT_APIKEY` (from the steps on callmebot.com).
 
 ## Setup
 
-1. **CallMeBot key**: follow the WhatsApp steps on callmebot.com. You save their number, send it the activation message, and it replies with your API key.
-2. **Repo secrets** (Settings → Secrets and variables → Actions → *Secrets*):
-   - `CALLMEBOT_PHONE`: your number, e.g. `+40712345678`
-   - `CALLMEBOT_APIKEY`: the key from step 1
-3. **Test**: Actions → *SICAP watcher* → *Run workflow*, tick "Only send a test WhatsApp message".
-4. **First real run**: *Run workflow* again, unticked. It saves the current listings and sends "SICAP watcher active". After that you only hear about new items.
+1. Add the secrets for at least one channel.
+2. **Test**: Actions → *SICAP watcher* → *Run workflow*, tick "Only send a test alert".
+3. **First real run**: *Run workflow* again, unticked. It saves the current listings and sends "SICAP watcher active". After that you only hear about new items.
 
 ## More pages
 
@@ -17,4 +22,4 @@ Add a repo *variable* `WATCH_URLS` (same settings page, *Variables* tab) with on
 
 ## If it breaks
 
-A failed run (page blocked, layout changed, WhatsApp not sent) shows red in Actions and GitHub emails you. The page screenshot is attached to the run as the `debug` artifact.
+A failed run (page blocked, layout changed, alert not sent) shows red in Actions and GitHub emails you. The page screenshot is attached to the run as the `debug` artifact.

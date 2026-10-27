@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       test_message:
-        description: "Only send a test WhatsApp message"
+        description: "Only send a test alert"
         type: boolean
         default: false
 
@@ -56,6 +56,9 @@ jobs:
         env:
           CALLMEBOT_PHONE: ${{ secrets.CALLMEBOT_PHONE }}
           CALLMEBOT_APIKEY: ${{ secrets.CALLMEBOT_APIKEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           WATCH_URLS: ${{ vars.WATCH_URLS }}
           FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
           TEST_MESSAGE: ${{ inputs.test_message && '1' || '0' }}

@@ -1,12 +1,14 @@
 """SICAP watcher: opens a sicap.ai authority page in headless Chromium,
-finds listings not seen before, and sends them to WhatsApp via CallMeBot.
+finds listings not seen before, and sends them to WhatsApp (CallMeBot), Telegram and/or ntfy.
 
 Env:
   WATCH_URLS         newline/comma separated pages to watch (default: Orasul Deta)
   CALLMEBOT_PHONE    your WhatsApp number in international format, e.g. +40712345678
   CALLMEBOT_APIKEY   key CallMeBot sent you
   FORCE_RUN=1        ignore the 08:00-22:00 window (manual runs)
-  TEST_MESSAGE=1     send a test WhatsApp message and exit
+  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   optional Telegram bot
+  NTFY_TOPIC         optional ntfy.sh topic (use a long random name)
+  TEST_MESSAGE=1     send a test message and exit
 """
 import json
 import os
@@ -43,40 +45,77 @@ def in_window():
     return 8 <= now_local().hour <= 22
 
 
-def send_whatsapp(text):
-    phone = os.environ.get("CALLMEBOT_PHONE", "").strip()
-    key = os.environ.get("CALLMEBOT_APIKEY", "").strip()
-    if not phone or not key:
-        print("CallMeBot secrets missing; message would have been:\n" + text)
-        return False
-    # CallMeBot works best with short messages; split long ones.
-    chunks, buf = [], ""
+def _env(name):
+    return os.environ.get(name, "").strip()
+
+
+def _chunks(text, limit):
+    out, buf = [], ""
     for block in text.split("\n\n"):
-        if len(buf) + len(block) > 900 and buf:
-            chunks.append(buf)
+        if len(buf) + len(block) > limit and buf:
+            out.append(buf)
             buf = ""
         buf = f"{buf}\n\n{block}" if buf else block
     if buf:
-        chunks.append(buf)
-    ok = True
-    for i, chunk in enumerate(chunks):
-        q = urllib.parse.urlencode({"phone": phone, "text": chunk, "apikey": key})
-        url = f"https://api.callmebot.com/whatsapp.php?{q}"
-        for attempt in range(3):
-            try:
-                with urllib.request.urlopen(url, timeout=60) as r:
-                    body = r.read().decode("utf-8", "replace")
+        out.append(buf)
+    return out
+
+
+def _request(name, url, data=None, headers=None):
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url, data=data, headers=headers or {})
+            with urllib.request.urlopen(req, timeout=60) as r:
                 if r.status == 200:
-                    break
-                print(f"CallMeBot HTTP {r.status}: {body[:200]}")
-            except Exception as e:  # noqa: BLE001
-                print(f"CallMeBot error: {e}")
-            time.sleep(10 * (attempt + 1))
-        else:
-            ok = False
-        if i < len(chunks) - 1:
-            time.sleep(5)  # CallMeBot rate limit
+                    return True
+                print(f"{name} HTTP {r.status}")
+        except Exception as e:  # noqa: BLE001
+            print(f"{name} error: {e}")
+        time.sleep(10 * (attempt + 1))
+    return False
+
+
+def send_callmebot(text):
+    phone, key = _env("CALLMEBOT_PHONE"), _env("CALLMEBOT_APIKEY")
+    ok = True
+    for chunk in _chunks(text, 900):
+        q = urllib.parse.urlencode({"phone": phone, "text": chunk, "apikey": key})
+        ok &= _request("CallMeBot", f"https://api.callmebot.com/whatsapp.php?{q}")
+        time.sleep(5)  # CallMeBot rate limit
     return ok
+
+
+def send_telegram(text):
+    token, chat = _env("TELEGRAM_BOT_TOKEN"), _env("TELEGRAM_CHAT_ID")
+    ok = True
+    for chunk in _chunks(text, 3500):
+        data = urllib.parse.urlencode({"chat_id": chat, "text": chunk,
+                                       "disable_web_page_preview": "true"}).encode()
+        ok &= _request("Telegram", f"https://api.telegram.org/bot{token}/sendMessage", data)
+    return ok
+
+
+def send_ntfy(text):
+    topic = _env("NTFY_TOPIC")
+    title, _, body = text.partition("\n")
+    q = urllib.parse.urlencode({"title": title})
+    return _request("ntfy", f"https://ntfy.sh/{urllib.parse.quote(topic)}?{q}",
+                    (body.strip() or title).encode("utf-8"))
+
+
+def notify(text):
+    """Send to every channel that has its secrets set. True if at least one worked."""
+    channels = []
+    if _env("CALLMEBOT_PHONE") and _env("CALLMEBOT_APIKEY"):
+        channels.append(send_callmebot)
+    if _env("TELEGRAM_BOT_TOKEN") and _env("TELEGRAM_CHAT_ID"):
+        channels.append(send_telegram)
+    if _env("NTFY_TOPIC"):
+        channels.append(send_ntfy)
+    if not channels:
+        print("No alert channel configured; message would have been:\n" + text)
+        return False
+    return any([ch(text) for ch in channels])
 
 
 EXTRACT_JS = r"""
@@ -186,7 +225,7 @@ def save_state(state):
 
 def main():
     if os.environ.get("TEST_MESSAGE") == "1":
-        ok = send_whatsapp("✅ SICAP watcher: test message. Alerts will arrive here.")
+        ok = notify("✅ SICAP watcher: test message. Alerts will arrive here.")
         sys.exit(0 if ok else 1)
 
     if not in_window():
@@ -210,14 +249,14 @@ def main():
         print(f"{url}: {len(items)} listings, {len(new)} new, first_run={first_run}")
 
         if first_run:
-            send_whatsapp(
+            notify(
                 f"✅ SICAP watcher active\n{len(items)} existing listings saved, "
                 f"you'll only get alerts for new ones.\n🔗 {url}"
             )
         elif new:
             header = f"🔔 SICAP – {len(new)} new" if len(new) > 1 else "🔔 SICAP – 1 new"
             body = "\n\n".join(format_item(i, items[i]) for i in new)
-            if not send_whatsapp(f"{header}\n\n{body}\n\n🔗 {url}"):
+            if not notify(f"{header}\n\n{body}\n\n🔗 {url}"):
                 failed.append(url)
                 continue  # don't mark as seen, retry next run
 
